@@ -5,30 +5,40 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+use trueos::input::KEYBOARD_OUTPUT_FLAG_PRESS;
 use trueos::ui4_scene::{Damage, Error as Ui4Error, Frame, ResizeEvent};
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, Capabilities, Device,
-    IndexedBatchDrawV2, IndexedDrawBatchV2, Queue, QueueClass, RenderPipeline, ShaderModule,
-    PRIMITIVE_TOPOLOGY_QUAD_LIST, SHADER_PACKAGE_CLIP_POSITION3_IMMEDIATE_RGBA_FNV1A64,
+    IndexedBatchDrawV2, IndexedDraw, IndexedDrawBatchV2, Queue, QueueClass, RenderPipeline,
+    ShaderModule,
+    PRIMITIVE_TOPOLOGY_QUAD_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+    SAMPLER_FLAGS_ALL, SHADER_PACKAGE_CLIP_POSITION3_IMMEDIATE_RGBA_FNV1A64,
+    SHADER_PACKAGE_CLIP_POSITION3_UV_TEXTURE_FNV1A64,
 };
 use trueos::{logl::{self, level}, vshell, vsys};
+
+include!(concat!(env!("OUT_DIR"), "/intel_logo_meta.rs"));
+
+const INTEL_LOGO_RGBA8: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/intel_logo_rgba8.bin"));
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
 const FRAME_X: i32 = 96;
 const FRAME_Y: i32 = 72;
 const CLEAR_RGBA8_SRGB: u32 = u32::from_le_bytes([0, 0, 0, 255]);
-const VERTEX_STRIDE_BYTES: usize = 12;
+const VERTEX_STRIDE_BYTES: usize = 20;
 const VERTEX_COUNT: usize = 4;
-const INDEX_COUNT: usize = 4;
+const QUAD_INDEX_COUNT: usize = 4;
+const TRIANGLE_INDEX_COUNT: usize = 6;
 
-const VERTICES: [[f32; 3]; VERTEX_COUNT] = [
-    [-0.95, -0.95, 0.0],
-    [0.95, -0.95, 0.0],
-    [0.95, 0.95, 0.0],
-    [-0.95, 0.95, 0.0],
+const VERTICES: [[f32; 5]; VERTEX_COUNT] = [
+    [-0.95, -0.95, 0.0, 0.0, 1.0],
+    [0.95, -0.95, 0.0, 1.0, 1.0],
+    [0.95, 0.95, 0.0, 1.0, 0.0],
+    [-0.95, 0.95, 0.0, 0.0, 0.0],
 ];
-const INDICES: [u32; INDEX_COUNT] = [0, 1, 2, 3];
+const INDICES: [u32; TRIANGLE_INDEX_COUNT] = [0, 1, 2, 3, 0, 2];
 
 #[global_allocator]
 static ALLOCATOR: trueos::TrueosAllocator = trueos::TrueosAllocator;
@@ -44,11 +54,15 @@ struct QuadTexture {
     queue: Queue,
     _shader: ShaderModule,
     pipeline: RenderPipeline,
+    _texture_shader: ShaderModule,
+    texture_pipeline: RenderPipeline,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
+    texture_buffer: Buffer,
     draw_batch: IndexedDrawBatchV2,
     timeline: u64,
     pending_resize: Option<ResizeEvent>,
+    triangles: bool,
 }
 
 impl QuadTexture {
@@ -67,6 +81,12 @@ impl QuadTexture {
         let pipeline = device
             .create_render_pipeline(shader, VERTEX_STRIDE_BYTES as u32, 0)
             .map_err(|error| DemoError::Vgpu("pipeline-create", error))?;
+        let texture_shader = device
+            .create_shader_module(SHADER_PACKAGE_CLIP_POSITION3_UV_TEXTURE_FNV1A64)
+            .map_err(|error| DemoError::Vgpu("texture-shader-create", error))?;
+        let texture_pipeline = device
+            .create_render_pipeline(texture_shader, VERTEX_STRIDE_BYTES as u32, 0)
+            .map_err(|error| DemoError::Vgpu("texture-pipeline-create", error))?;
 
         let vertex_buffer = device
             .create_buffer(vertex_bytes().len(), BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_VERTEX)
@@ -74,11 +94,16 @@ impl QuadTexture {
         let index_buffer = device
             .create_buffer(index_bytes().len(), BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_INDEX)
             .map_err(|error| DemoError::Vgpu("index-buffer-create", error))?;
+        let texture_buffer = device
+            .create_buffer(INTEL_LOGO_RGBA8.len(), BUFFER_USAGE_MAP_WRITE)
+            .map_err(|error| DemoError::Vgpu("texture-buffer-create", error))?;
 
         write_exact(device, vertex_buffer, &vertex_bytes())
             .map_err(|error| DemoError::Vgpu("vertex-upload", error))?;
         write_exact(device, index_buffer, &index_bytes())
             .map_err(|error| DemoError::Vgpu("index-upload", error))?;
+        write_exact(device, texture_buffer, INTEL_LOGO_RGBA8)
+            .map_err(|error| DemoError::Vgpu("texture-upload", error))?;
 
         let mut draw_batch = IndexedDrawBatchV2 {
             clear_rgba8_srgb: CLEAR_RGBA8_SRGB,
@@ -87,7 +112,7 @@ impl QuadTexture {
             ..IndexedDrawBatchV2::default()
         };
         draw_batch.draws[0] = IndexedBatchDrawV2 {
-            index_count: INDEX_COUNT as u32,
+            index_count: QUAD_INDEX_COUNT as u32,
             first_index: 0,
             base_vertex: 0,
             rgba8_srgb: u32::from_le_bytes([255, 255, 255, 255]),
@@ -101,12 +126,35 @@ impl QuadTexture {
             queue,
             _shader: shader,
             pipeline,
+            _texture_shader: texture_shader,
+            texture_pipeline,
             vertex_buffer,
             index_buffer,
+            texture_buffer,
             draw_batch,
             timeline: 0,
             pending_resize: None,
+            triangles: false,
         })
+    }
+
+    fn service_keyboard_events(&mut self) -> Result<(), DemoError> {
+        while let Some(event) = self
+            .frame
+            .take_keyboard_event()
+            .map_err(|error| DemoError::Ui4("keyboard-event-take", error))?
+        {
+            if event.flags & KEYBOARD_OUTPUT_FLAG_PRESS != 0 && event.codepoint == '3' as u32 {
+                if self.triangles {
+                    continue;
+                }
+                self.triangles = true;
+                self.draw_batch.draws[0].index_count = TRIANGLE_INDEX_COUNT as u32;
+                self.draw_batch.draws[0].topology = PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                logl::log(level::INFO, "QuadTexture: switched to two triangles");
+            }
+        }
+        Ok(())
     }
 
     fn render_frame(&mut self) -> Result<(), DemoError> {
@@ -122,17 +170,38 @@ impl QuadTexture {
             .acquire_ui4_surface(self.frame.window_id())
             .map_err(|error| DemoError::Vgpu("surface-acquire", error))?;
 
-        let point = self
-            .device
-            .submit_ui4_indexed_batch_v2(
-                self.queue,
-                surface,
-                self.pipeline,
-                self.vertex_buffer,
-                self.index_buffer,
-                self.draw_batch,
-            )
-            .map_err(|error| DemoError::Vgpu("indexed-batch-v2-submit", error))?;
+        let point = if self.triangles {
+            self.device
+                .submit_ui4_indexed(
+                    self.queue,
+                    surface,
+                    self.texture_pipeline,
+                    self.vertex_buffer,
+                    self.index_buffer,
+                    IndexedDraw {
+                        index_count: TRIANGLE_INDEX_COUNT as u32,
+                        clear_rgba8_srgb: CLEAR_RGBA8_SRGB,
+                        sampled_texture: self.texture_buffer.raw(),
+                        texture_width: INTEL_LOGO_WIDTH,
+                        texture_height: INTEL_LOGO_HEIGHT,
+                        texture_pitch: INTEL_LOGO_WIDTH * 4,
+                        sampler_flags: SAMPLER_FLAGS_ALL,
+                        ..IndexedDraw::default()
+                    },
+                )
+                .map_err(|error| DemoError::Vgpu("textured-indexed-submit", error))?
+        } else {
+            self.device
+                .submit_ui4_indexed_batch_v2(
+                    self.queue,
+                    surface,
+                    self.pipeline,
+                    self.vertex_buffer,
+                    self.index_buffer,
+                    self.draw_batch,
+                )
+                .map_err(|error| DemoError::Vgpu("indexed-batch-v2-submit", error))?
+        };
 
         self.device
             .wait(self.queue, point.value)
@@ -187,7 +256,7 @@ fn vertex_bytes() -> Vec<u8> {
 }
 
 fn index_bytes() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(INDEX_COUNT * core::mem::size_of::<u32>());
+    let mut bytes = Vec::with_capacity(TRIANGLE_INDEX_COUNT * core::mem::size_of::<u32>());
     for index in INDICES {
         bytes.extend_from_slice(&index.to_le_bytes());
     }
@@ -230,6 +299,7 @@ fn run() -> Result<(), DemoError> {
 
     loop {
         vsys::poll_once();
+        app.service_keyboard_events()?;
         match app.render_frame() {
             Ok(()) => break,
             Err(error) if transient_frame_error(&error) => vsys::sleep_ms(16),
@@ -249,6 +319,7 @@ fn run() -> Result<(), DemoError> {
 
     loop {
         vsys::poll_once();
+        app.service_keyboard_events()?;
         match app.render_frame() {
             Ok(()) => {}
             Err(error) if transient_frame_error(&error) => {}
