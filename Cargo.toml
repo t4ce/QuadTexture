@@ -1,0 +1,24 @@
+[package]
+name = "QuadTexture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Minimal indexed-quad texture Blueprint example."
+
+[package.metadata.trueos-blueprint]
+replicatable = true
+
+[[bin]]
+name = "QuadTexture"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+trueos = { path = "../TRUEOS-Blueprints/api" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
