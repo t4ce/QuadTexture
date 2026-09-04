@@ -12,7 +12,8 @@ use trueos::vgpu::{
     IndexedBatchDrawV2, IndexedDraw, IndexedDrawBatchV2, Queue, QueueClass, RenderPipeline,
     ShaderModule,
     PRIMITIVE_TOPOLOGY_QUAD_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-    SAMPLER_FLAGS_ALL, SHADER_PACKAGE_CLIP_POSITION3_IMMEDIATE_RGBA_FNV1A64,
+    SAMPLER_ADDRESS_U_REPEAT, SAMPLER_ADDRESS_V_REPEAT,
+    SHADER_PACKAGE_CLIP_POSITION3_IMMEDIATE_RGBA_FNV1A64,
     SHADER_PACKAGE_CLIP_POSITION3_UV_TEXTURE_FNV1A64,
 };
 use trueos::{logl::{self, level}, vshell, vsys};
@@ -185,7 +186,7 @@ impl QuadTexture {
                         texture_width: INTEL_LOGO_WIDTH,
                         texture_height: INTEL_LOGO_HEIGHT,
                         texture_pitch: INTEL_LOGO_WIDTH * 4,
-                        sampler_flags: SAMPLER_FLAGS_ALL,
+                        sampler_flags: SAMPLER_ADDRESS_U_REPEAT | SAMPLER_ADDRESS_V_REPEAT,
                         ..IndexedDraw::default()
                     },
                 )
