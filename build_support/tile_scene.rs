@@ -8,7 +8,7 @@ use trueos_picasso::Store;
 
 pub const COLS: usize = 6;
 pub const ROWS: usize = 4;
-pub const TILE: usize = 1024;
+pub const TILE: usize = 512;
 pub const GUTTER: usize = 2;
 pub const SLOT: usize = TILE + GUTTER * 2;
 pub const ATLAS_WIDTH: usize = COLS * SLOT;
@@ -455,7 +455,7 @@ pub fn prepare(sources: &[(String, u64, Vec<u8>)]) -> PreparedScene {
     assert_eq!(generated_count, 3);
     let (min, max) = bounds(&all_positions);
     let encoded = atlases.map(|rgba| encode_png(&rgba));
-    let metadata = json!({"schema":1,"policy":"Original glTF TRIANGLES; source default scenes and node transforms, then explicit gallery placement; no quad reconstruction, no decimation, no image resampling.","vertex_stride":48,"vertex_count":vertices.len()/48,"index_count":indices.len()/4,"triangle_count":source_triangles,"native_quad_count":0,"asset_count":sources.len(),"bounds_min":min,"bounds_max":max,"atlas":{"width":ATLAS_WIDTH,"height":ATLAS_HEIGHT,"tile_size":TILE,"gutter":GUTTER,"gutter_mode":"REPEAT","columns":COLS,"rows":ROWS,"filtering":"Runtime base-level bilinear only; authored mipmap minification is retained as metadata but mip chains are not generated."},"vertices_sha256":sha(&vertices),"indices_sha256":sha(&indices),"atlas_sha256":encoded.iter().map(|b|sha(b)).collect::<Vec<_>>(),"assets":assets});
+    let metadata = json!({"schema":1,"policy":"Original glTF TRIANGLES; source default scenes and node transforms, then explicit gallery placement; no quad reconstruction or decimation. Authored texture maps are preprocessed offline to 512px.","vertex_stride":48,"vertex_count":vertices.len()/48,"index_count":indices.len()/4,"triangle_count":source_triangles,"native_quad_count":0,"asset_count":sources.len(),"bounds_min":min,"bounds_max":max,"atlas":{"width":ATLAS_WIDTH,"height":ATLAS_HEIGHT,"tile_size":TILE,"gutter":GUTTER,"gutter_mode":"REPEAT","columns":COLS,"rows":ROWS,"filtering":"Runtime base-level bilinear only; authored mipmap minification is retained as metadata but mip chains are not generated."},"vertices_sha256":sha(&vertices),"indices_sha256":sha(&indices),"atlas_sha256":encoded.iter().map(|b|sha(b)).collect::<Vec<_>>(),"assets":assets});
     PreparedScene {
         vertices,
         indices,
