@@ -32,7 +32,7 @@ impl DrawMode {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Quad => "one textured native quad",
-            Self::Triangles => "GLB triangle gallery",
+            Self::Triangles => "GLB triangle gallery and tiled floor",
         }
     }
 }

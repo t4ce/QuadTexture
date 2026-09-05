@@ -4,16 +4,49 @@ use trueos_picasso::cam::{Camera, Projection, Quaternion};
 
 /// Frame the complete imported gallery, with a five-percent border on each
 /// screen edge and a slight oblique view that reveals the panels' thickness.
+#[cfg(test)]
 pub(crate) fn gallery_camera(
     bounds_min: [f32; 3],
     bounds_max: [f32; 3],
     viewport_width: u32,
     viewport_height: u32,
 ) -> Camera {
+    framed_camera(
+        bounds_min,
+        bounds_max,
+        viewport_width,
+        viewport_height,
+        [0.12, -0.08, 1.0],
+    )
+}
+
+/// An elevated reset view fits both the upright catalog and its tiled floor.
+pub(crate) fn floor_gallery_camera(
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Camera {
+    framed_camera(
+        bounds_min,
+        bounds_max,
+        viewport_width,
+        viewport_height,
+        [0.12, 0.65, 1.0],
+    )
+}
+
+fn framed_camera(
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    viewport_width: u32,
+    viewport_height: u32,
+    direction: [f32; 3],
+) -> Camera {
     const NEAR: f32 = 0.05;
     const NDC_MARGIN: f32 = 0.90;
     let center: [f32; 3] = core::array::from_fn(|axis| (bounds_min[axis] + bounds_max[axis]) * 0.5);
-    let rotation = look_at_camera_rotation([0.12, -0.08, 1.0], [0.0; 3], [0.0, -1.0, 0.0]);
+    let rotation = look_at_camera_rotation(direction, [0.0; 3], [0.0, -1.0, 0.0]);
     let [x, y, z, w] = rotation.0;
     let inverse_rotation = Quaternion([-x, -y, -z, w]);
     let backward = rotation.rotate([0.0, 0.0, 1.0]);
@@ -436,6 +469,35 @@ mod tests {
             }
             assert_close(largest_ndc, 0.9);
             assert!(input.rotation.rotate([0.0, 1.0, 0.0])[1] < 0.0);
+        }
+    }
+
+    #[test]
+    fn reset_frames_the_floor_from_above_at_landscape_and_portrait_aspects() {
+        let bounds_min = [-16.0, -5.6, -0.3];
+        let bounds_max = [16.0, 4.75, 32.0];
+        for (width, height) in [(640, 360), (360, 640), (600, 600)] {
+            let input = floor_gallery_camera(bounds_min, bounds_max, width, height);
+            assert!(input.position[1] > bounds_max[1]);
+            assert!(input.position[2] > bounds_max[2]);
+            assert!(input.rotation.rotate([0.0, 0.0, -1.0])[1] < 0.0);
+            let camera = retained_camera(input, width, height, identity_mat4());
+            for corner in 0..8 {
+                let point = core::array::from_fn(|axis| {
+                    if axis == 3 {
+                        1.0
+                    } else if corner & (1 << axis) == 0 {
+                        bounds_min[axis]
+                    } else {
+                        bounds_max[axis]
+                    }
+                });
+                let clip = transform(camera.view_projection, point);
+                assert!(clip[3] > 0.0);
+                assert!((clip[0] / clip[3]).abs() <= 0.9002);
+                assert!((clip[1] / clip[3]).abs() <= 0.9002);
+                assert!((0.0..1.0).contains(&(clip[2] / clip[3])));
+            }
         }
     }
 

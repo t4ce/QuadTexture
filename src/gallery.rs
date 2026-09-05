@@ -2,10 +2,11 @@
 use super::{DemoError, camera, write_exact};
 use trueos::ui4_scene::Frame;
 use trueos::vgpu::{
-    BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, Device,
-    PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, Queue, RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV_TANGENT,
-    RetainedFrameSubmit, RetainedFrameSubmitV2, RetainedMaterial, RetainedMaterialParameters,
-    RetainedMesh, RetainedMeshDescriptor, RetainedTransformSeed, TimelinePoint, Ui4Surface,
+    BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_READ, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer,
+    Device, PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, Queue, RETAINED_VERTEX_LAYOUT_POS_NORMAL_UV_TANGENT,
+    RetainedDrawRange, RetainedFrameSubmit, RetainedFrameSubmitV2, RetainedFrameSubmitV3,
+    RetainedMaterial, RetainedMaterialParameters, RetainedMesh, RetainedMeshDescriptor,
+    TimelinePoint, Ui4Surface,
 };
 use trueos::{
     clock,
@@ -24,6 +25,7 @@ pub struct Gallery {
     _assets: Picasso,
     vertices: Buffer,
     indices: Buffer,
+    seeds: Buffer,
     mesh: RetainedMesh,
     base_color: RetainedTexture,
     orm: RetainedTexture,
@@ -32,7 +34,6 @@ pub struct Gallery {
     previous_view_projection: [f32; 16],
     submitted_view_projection: [f32; 16],
     previous_millis: u64,
-    radius: f32,
     frames: u64,
 }
 
@@ -61,6 +62,18 @@ impl Gallery {
             Ok(bytes)
         };
         store("scene/metadata.json", SCENE_METADATA.as_bytes())?;
+        let seed_bytes = store("scene/instances.trs", SCENE_SEEDS)?;
+        if seed_bytes.len() != SCENE_INSTANCE_COUNT as usize * 64 {
+            return Err(DemoError::Contract("prepared scene seed layout"));
+        }
+        let seeds = device
+            .create_buffer(
+                seed_bytes.len(),
+                BUFFER_USAGE_MAP_WRITE | BUFFER_USAGE_MAP_READ,
+            )
+            .map_err(|code| DemoError::Vgpu("scene-seeds-create", code))?;
+        write_exact(device, seeds, &seed_bytes)
+            .map_err(|code| DemoError::Vgpu("scene-seeds-upload", code))?;
         let vertex_bytes = store("scene/vertices.pnut", SCENE_VERTICES)?;
         let index_bytes = store("scene/indices.u32", SCENE_INDICES)?;
         let vertices = device
@@ -127,22 +140,14 @@ impl Gallery {
         let orm = decode("scene/orm.png", ORM_PNG)?;
         let normal = decode("scene/normal.png", NORMAL_PNG)?;
         let initial_camera =
-            camera::gallery_camera(SCENE_BOUNDS_MIN, SCENE_BOUNDS_MAX, width, height);
+            camera::floor_gallery_camera(SCENE_BOUNDS_MIN, SCENE_BOUNDS_MAX, width, height);
         let previous_view_projection =
             camera::retained_camera(initial_camera, width, height, camera::identity_mat4())
                 .view_projection;
-        let radius = libm::sqrtf(
-            (0..3)
-                .map(|i| {
-                    let distance = SCENE_BOUNDS_MIN[i].abs().max(SCENE_BOUNDS_MAX[i].abs());
-                    distance * distance
-                })
-                .sum::<f32>(),
-        ) + 0.01;
         logl::log(
             level::INFO,
             format_args!(
-                "QuadTexture: gallery ready assets={} vertices={} triangles={} layout=6x4 material=base+ORM+normal source=durable-picasso-import runtime=ephemeral-redb",
+                "QuadTexture: gallery+floor ready assets={} vertices={} mesh_triangles={} gallery=6x4 floor=16x16 interior=196 border=60 instances=257 material=base+ORM+normal source=durable-picasso-import runtime=ephemeral-redb",
                 SCENE_ASSET_COUNT,
                 SCENE_VERTEX_COUNT,
                 SCENE_INDEX_COUNT / 3
@@ -152,6 +157,7 @@ impl Gallery {
             _assets: assets,
             vertices,
             indices,
+            seeds,
             mesh,
             base_color,
             orm,
@@ -160,13 +166,12 @@ impl Gallery {
             previous_view_projection,
             submitted_view_projection: previous_view_projection,
             previous_millis: clock::monotonic_millis(),
-            radius,
             frames: 0,
         })
     }
 
     pub fn reset_camera(&mut self, width: u32, height: u32) {
-        self.flycam.camera = camera::gallery_camera(
+        self.flycam.camera = camera::floor_gallery_camera(
             prepared::SCENE_BOUNDS_MIN,
             prepared::SCENE_BOUNDS_MAX,
             width,
@@ -204,9 +209,8 @@ impl Gallery {
             height,
             self.previous_view_projection,
         );
-        let mut frame = RetainedFrameSubmit {
+        let frame = RetainedFrameSubmit {
             camera,
-            seed_count: 1,
             clear_rgba8_srgb: u32::from_le_bytes([12, 16, 24, 255]),
             material: RetainedMaterial {
                 // glTF's packed image serves two roles, sharing one residency.
@@ -221,23 +225,32 @@ impl Gallery {
             },
             ..RetainedFrameSubmit::default()
         };
-        frame.seeds[0] = RetainedTransformSeed {
-            scale: [1.0; 3],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-            local_radius: self.radius,
-            ..RetainedTransformSeed::default()
+        let mut submit = RetainedFrameSubmitV3 {
+            frame: RetainedFrameSubmitV2 {
+                frame,
+                material_parameters: RetainedMaterialParameters::default(),
+            },
+            seed_buffer: self.seeds.raw(),
+            seed_count: prepared::SCENE_INSTANCE_COUNT,
+            draw_count: prepared::SCENE_DRAW_RANGES.len() as u32,
+            ..RetainedFrameSubmitV3::default()
         };
+        for (out, [first_index, index_count]) in
+            submit.draws.iter_mut().zip(prepared::SCENE_DRAW_RANGES)
+        {
+            *out = RetainedDrawRange {
+                first_index,
+                index_count,
+            };
+        }
         let point = device
-            .submit_retained_frame_v2(
+            .submit_retained_frame_v3(
                 queue,
                 surface,
                 self.mesh,
                 self.vertices,
                 self.indices,
-                RetainedFrameSubmitV2 {
-                    frame,
-                    material_parameters: RetainedMaterialParameters::default(),
-                },
+                submit,
             )
             .map_err(|code| DemoError::Vgpu("gallery-retained-submit", code))?;
         self.submitted_view_projection = camera.view_projection;
@@ -251,9 +264,9 @@ impl Gallery {
             logl::log(
                 level::INFO,
                 format_args!(
-                    "QuadTexture: gallery frame published assets={} triangles={} topology=TriangleList timeline={} frame={}",
+                    "QuadTexture: gallery+floor frame published assets={} triangles={} instances=257 floor=16x16 interior=196 border=60 topology=TriangleList timeline={} frame={}",
                     prepared::SCENE_ASSET_COUNT,
-                    prepared::SCENE_INDEX_COUNT / 3,
+                    prepared::SCENE_RENDERED_TRIANGLES,
                     timeline,
                     self.frames
                 ),

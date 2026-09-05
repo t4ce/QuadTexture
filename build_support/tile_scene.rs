@@ -17,6 +17,7 @@ const SPACING: f32 = 2.5;
 type Matrix = [[f32; 4]; 4]; // glTF column-major.
 
 pub struct PreparedScene {
+    pub seeds: Vec<u8>,
     pub vertices: Vec<u8>,
     pub indices: Vec<u8>,
     pub atlases: [Vec<u8>; 3],
@@ -456,12 +457,182 @@ pub fn prepare(sources: &[(String, u64, Vec<u8>)]) -> PreparedScene {
     let (min, max) = bounds(&all_positions);
     let encoded = atlases.map(|rgba| encode_png(&rgba));
     let metadata = json!({"schema":1,"policy":"Original glTF TRIANGLES; source default scenes and node transforms, then explicit gallery placement; no quad reconstruction or decimation. Authored texture maps are preprocessed offline to 512px.","vertex_stride":48,"vertex_count":vertices.len()/48,"index_count":indices.len()/4,"triangle_count":source_triangles,"native_quad_count":0,"asset_count":sources.len(),"bounds_min":min,"bounds_max":max,"atlas":{"width":ATLAS_WIDTH,"height":ATLAS_HEIGHT,"tile_size":TILE,"gutter":GUTTER,"gutter_mode":"REPEAT","columns":COLS,"rows":ROWS,"filtering":"Runtime base-level bilinear only; authored mipmap minification is retained as metadata but mip chains are not generated."},"vertices_sha256":sha(&vertices),"indices_sha256":sha(&indices),"atlas_sha256":encoded.iter().map(|b|sha(b)).collect::<Vec<_>>(),"assets":assets});
-    PreparedScene {
+    let mut scene = PreparedScene {
+        seeds: Vec::new(),
         vertices,
         indices,
         atlases: encoded,
         metadata,
+    };
+    add_retained_floor(&mut scene);
+    scene
+}
+
+const FLOOR_SIDE: usize = 16;
+const FLOOR_INNER_ASSET: &str = "reinforced_metal_wall2/GLB/reinforced_metal_wall2.glb";
+const FLOOR_BORDER_ASSET: &str = "bathroom_tiles_1/GLB/bathroom_tiles_1.glb";
+
+/// Append one local copy of each floor mesh, then only compact TRS rows for
+/// its repeated placements. All UVs still address the existing atlas slots.
+fn add_retained_floor(scene: &mut PreparedScene) {
+    let catalog_min: [f32; 3] =
+        serde_json::from_value(scene.metadata["bounds_min"].clone()).unwrap();
+    let catalog_max: [f32; 3] =
+        serde_json::from_value(scene.metadata["bounds_max"].clone()).unwrap();
+    let catalog_indices = scene.indices.len() / 4;
+    let catalog_radius = (0..3)
+        .map(|a| catalog_min[a].abs().max(catalog_max[a].abs()).powi(2))
+        .sum::<f32>()
+        .sqrt();
+    let assets = scene.metadata["assets"].as_array().unwrap().clone();
+    let mut ranges = vec![[0u32, catalog_indices as u32]];
+    let mut local_bounds = Vec::new();
+    let mut local_meshes = Vec::new();
+    for name in [FLOOR_INNER_ASSET, FLOOR_BORDER_ASSET] {
+        let asset = assets
+            .iter()
+            .find(|a| a["asset"] == name)
+            .expect("selected floor asset");
+        let first = asset["first_vertex"].as_u64().unwrap() as usize;
+        let count = asset["vertex_count"].as_u64().unwrap() as usize;
+        let first_index = asset["first_index"].as_u64().unwrap() as usize;
+        let index_count = asset["index_count"].as_u64().unwrap() as usize;
+        let mut vertices: Vec<[f32; 12]> = scene.vertices[first * 48..(first + count) * 48]
+            .chunks_exact(48)
+            .map(|v| {
+                core::array::from_fn(|a| {
+                    f32::from_le_bytes(v[a * 4..a * 4 + 4].try_into().unwrap())
+                })
+            })
+            .collect();
+        let positions: Vec<[f32; 3]> = vertices
+            .iter()
+            .map(|v| v[..3].try_into().unwrap())
+            .collect();
+        let (min, max) = bounds(&positions);
+        let center: [f32; 3] = core::array::from_fn(|a| (min[a] + max[a]) * 0.5);
+        let local_min: [f32; 3] = core::array::from_fn(|a| min[a] - center[a]);
+        let local_max: [f32; 3] = core::array::from_fn(|a| max[a] - center[a]);
+        local_bounds.push((local_min, local_max));
+        let vertex_base = scene.vertices.len() / 48;
+        for v in &mut vertices {
+            for a in 0..3 {
+                v[a] -= center[a];
+            }
+            for value in *v {
+                scene.vertices.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let indices: Vec<u32> = scene.indices[first_index * 4..(first_index + index_count) * 4]
+            .chunks_exact(4)
+            .map(|i| u32::from_le_bytes(i.try_into().unwrap()))
+            .collect();
+        let index_base = scene.indices.len() / 4;
+        for i in indices {
+            scene
+                .indices
+                .extend_from_slice(&(i - first as u32 + vertex_base as u32).to_le_bytes());
+        }
+        ranges.push([index_base as u32, index_count as u32]);
+        local_meshes.push(json!({"asset":name,"vertex_count":count,"first_vertex":vertex_base,"first_index":index_base,"index_count":index_count,"source_atlas_slot":asset["atlas_slot"]}));
     }
+    let pitch_x = local_bounds[0].1[0] - local_bounds[0].0[0];
+    let pitch_z = local_bounds[0].1[1] - local_bounds[0].0[1];
+    for (min, max) in &local_bounds {
+        assert!(((max[0] - min[0]) - pitch_x).abs() < 0.001);
+        assert!(((max[1] - min[1]) - pitch_z).abs() < 0.001);
+    }
+    let floor_level = catalog_min[1] - 0.5;
+    let mut seed_rows = Vec::new();
+    fn seed(
+        translation: [f32; 3],
+        rotation: [f32; 4],
+        radius: f32,
+        group: u32,
+        slot: u32,
+    ) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        let values: Vec<f32> = translation
+            .into_iter()
+            .chain([1.0; 3])
+            .chain(rotation)
+            .chain([radius])
+            .chain(translation)
+            .collect();
+        for (i, f) in values.into_iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        out[56..60].copy_from_slice(&group.to_le_bytes());
+        out[60..64].copy_from_slice(&(slot << 16).to_le_bytes());
+        out
+    }
+    seed_rows.extend_from_slice(&seed([0.0; 3], [0.0, 0.0, 0.0, 1.0], catalog_radius, 0, 0));
+    let mut counts = [0u32; 2];
+    let mut floor_tiles = Vec::new();
+    let mut all_corners = vec![catalog_min, catalog_max];
+    for row in 0..FLOOR_SIDE {
+        for col in 0..FLOOR_SIDE {
+            let border = row == 0 || col == 0 || row == FLOOR_SIDE - 1 || col == FLOOR_SIDE - 1;
+            let kind = usize::from(border);
+            let (min, max) = local_bounds[kind];
+            let translation = [
+                (col as f32 - (FLOOR_SIDE - 1) as f32 * 0.5) * pitch_x,
+                floor_level - max[2],
+                (row as f32 + 0.5) * pitch_z,
+            ];
+            let radius = (0..3)
+                .map(|a| min[a].abs().max(max[a].abs()).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            // -90 degrees around X: the panel's +Z front becomes the +Y floor top.
+            seed_rows.extend_from_slice(&seed(
+                translation,
+                [
+                    -core::f32::consts::FRAC_1_SQRT_2,
+                    0.0,
+                    0.0,
+                    core::f32::consts::FRAC_1_SQRT_2,
+                ],
+                radius,
+                kind as u32 + 1,
+                counts[kind],
+            ));
+            floor_tiles.push(json!({"row":row,"column":col,"border":border,"draw_group":kind+1,"slot":counts[kind],"translation":translation}));
+            counts[kind] += 1;
+            for corner in 0..8 {
+                let p: [f32; 3] = core::array::from_fn(|a| {
+                    if corner & (1 << a) == 0 {
+                        min[a]
+                    } else {
+                        max[a]
+                    }
+                });
+                all_corners.push([
+                    translation[0] + p[0],
+                    translation[1] + p[2],
+                    translation[2] - p[1],
+                ]);
+            }
+        }
+    }
+    assert_eq!(counts, [196, 60]);
+    let (min, max) = bounds(&all_corners);
+    scene.metadata["gallery_bounds_min"] = json!(catalog_min);
+    scene.metadata["gallery_bounds_max"] = json!(catalog_max);
+    scene.metadata["bounds_min"] = json!(min);
+    scene.metadata["bounds_max"] = json!(max);
+    scene.metadata["vertex_count"] = json!(scene.vertices.len() / 48);
+    scene.metadata["index_count"] = json!(scene.indices.len() / 4);
+    scene.metadata["draw_ranges"] = json!(ranges);
+    scene.metadata["instance_count"] = json!(1 + FLOOR_SIDE * FLOOR_SIDE);
+    scene.metadata["rendered_triangle_count"] = json!(
+        catalog_indices / 3 + ranges[1][1] as usize / 3 * 196 + ranges[2][1] as usize / 3 * 60
+    );
+    scene.metadata["floor"] = json!({"rows":FLOOR_SIDE,"columns":FLOOR_SIDE,"pitch":[pitch_x,pitch_z],"top_y":floor_level,"interior_count":counts[0],"border_count":counts[1],"meshes":local_meshes,"tiles":floor_tiles});
+    scene.metadata["vertices_sha256"] = json!(sha(&scene.vertices));
+    scene.metadata["indices_sha256"] = json!(sha(&scene.indices));
+    scene.metadata["seeds_sha256"] = json!(sha(&seed_rows));
+    scene.seeds = seed_rows;
 }
 
 pub fn build(root: &Path, out: &Path) {
@@ -508,6 +679,7 @@ pub fn build(root: &Path, out: &Path) {
     for (name, bytes) in [
         ("tile_scene.vertices", prepared.vertices.as_slice()),
         ("tile_scene.indices", prepared.indices.as_slice()),
+        ("tile_scene.seeds", prepared.seeds.as_slice()),
         ("base_color.png", prepared.atlases[0].as_slice()),
         ("orm.png", prepared.atlases[1].as_slice()),
         ("normal.png", prepared.atlases[2].as_slice()),
@@ -524,6 +696,7 @@ pub fn build(root: &Path, out: &Path) {
     for name in [
         "tile_scene.vertices",
         "tile_scene.indices",
+        "tile_scene.seeds",
         "base_color.png",
         "orm.png",
         "normal.png",
@@ -555,9 +728,14 @@ pub fn build(root: &Path, out: &Path) {
             meta["atlas_sha256"][i].as_str().unwrap()
         );
     }
+    assert_eq!(
+        sha(&fs::read(out.join("tile_scene.seeds")).unwrap()),
+        meta["seeds_sha256"].as_str().unwrap()
+    );
     let generated = format!(
         r#"pub const SCENE_VERTICES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tile_scene.vertices"));
 pub const SCENE_INDICES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tile_scene.indices"));
+pub const SCENE_SEEDS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tile_scene.seeds"));
 pub const BASE_COLOR_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/base_color.png"));
 pub const ORM_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/orm.png"));
 pub const NORMAL_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/normal.png"));
@@ -565,6 +743,9 @@ pub const SCENE_METADATA: &str = include_str!(concat!(env!("OUT_DIR"), "/tile_sc
 pub const SCENE_VERTEX_COUNT: u32 = {};
 pub const SCENE_INDEX_COUNT: u32 = {};
 pub const SCENE_ASSET_COUNT: u32 = 24;
+pub const SCENE_INSTANCE_COUNT: u32 = 257;
+pub const SCENE_DRAW_RANGES: [[u32; 2]; 3] = {draw_ranges:?};
+pub const SCENE_RENDERED_TRIANGLES: u32 = {rendered_triangles};
 pub const SCENE_BOUNDS_MIN: [f32; 3] = {:?};
 pub const SCENE_BOUNDS_MAX: [f32; 3] = {:?};
 pub const ATLAS_WIDTH: u32 = {};
@@ -575,7 +756,9 @@ pub const ATLAS_HEIGHT: u32 = {};
         serde_json::from_value::<[f32; 3]>(meta["bounds_min"].clone()).unwrap(),
         serde_json::from_value::<[f32; 3]>(meta["bounds_max"].clone()).unwrap(),
         ATLAS_WIDTH,
-        ATLAS_HEIGHT
+        ATLAS_HEIGHT,
+        draw_ranges = serde_json::from_value::<[[u32; 2]; 3]>(meta["draw_ranges"].clone()).unwrap(),
+        rendered_triangles = meta["rendered_triangle_count"],
     );
     fs::write(out.join("tile_scene_meta.rs"), generated).unwrap();
 }
@@ -718,7 +901,8 @@ mod tests {
             serde_json::from_slice(&fs::read(out.join("tile_scene.json")).unwrap()).unwrap();
         assert_eq!(metadata["asset_count"], 24);
         assert_eq!(metadata["triangle_count"], 604);
-        assert_eq!(metadata["index_count"], 1812);
+        assert_eq!(metadata["index_count"], 2484);
+        assert_eq!(metadata["vertex_count"], 1616);
         assert_eq!(metadata["native_quad_count"], 0);
         let vertices = fs::read(out.join("tile_scene.vertices")).unwrap();
         let indices = fs::read(out.join("tile_scene.indices")).unwrap();
@@ -726,13 +910,19 @@ mod tests {
             vertices.len(),
             metadata["vertex_count"].as_u64().unwrap() as usize * 48
         );
-        assert_eq!(indices.len(), 1812 * 4);
+        assert_eq!(indices.len(), 2484 * 4);
         assert!(
             indices
                 .chunks_exact(4)
                 .all(|i| u32::from_le_bytes(i.try_into().unwrap()) < (vertices.len() / 48) as u32)
         );
         let store = Store::open(out.join("tilepack.picasso.redb").to_str().unwrap()).unwrap();
+        verify_retained_floor(
+            &metadata,
+            &vertices,
+            &indices,
+            &fs::read(out.join("tile_scene.seeds")).unwrap(),
+        );
         let paths = asset_paths(&root());
         // Reopen the emitted PNGs and compare every interior source texel, not just a hash of encoded output.
         for (map, name) in ["base_color.png", "orm.png", "normal.png"]
@@ -798,6 +988,135 @@ mod tests {
         fs::write(&preserved, serde_json::to_vec_pretty(&metadata).unwrap()).unwrap();
         println!("Full scene artifacts verified at {}", out.display());
         // Keep the output for the independent kernel PNG decoder capacity audit.
+    }
+
+    fn verify_retained_floor(metadata: &Value, vertices: &[u8], indices: &[u8], seeds: &[u8]) {
+        use trueos_picasso::cam::Quaternion;
+        let floor = &metadata["floor"];
+        assert_eq!(floor["interior_count"], 196);
+        assert_eq!(floor["border_count"], 60);
+        assert_eq!(metadata["instance_count"], 257);
+        assert_eq!(metadata["rendered_triangle_count"], 42_876);
+        assert_eq!(
+            metadata["draw_ranges"],
+            json!([[0, 1812], [1812, 636], [2448, 36]])
+        );
+        assert_eq!(seeds.len(), 257 * 64);
+        assert_eq!(sha(seeds), metadata["seeds_sha256"].as_str().unwrap());
+        let floats = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(4)
+                .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                .collect()
+        };
+        let positions = |first: usize, count: usize| -> Vec<[f32; 3]> {
+            vertices[first * 48..(first + count) * 48]
+                .chunks_exact(48)
+                .map(|v| floats(&v[..12]).try_into().unwrap())
+                .collect()
+        };
+        let meshes = floor["meshes"].as_array().unwrap();
+        assert_eq!(
+            meshes.len(),
+            2,
+            "only one retained geometry copy per floor material"
+        );
+        let mut local_positions = Vec::new();
+        for (kind, (name, slot)) in [(FLOOR_INNER_ASSET, 18), (FLOOR_BORDER_ASSET, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let mesh = &meshes[kind];
+            assert_eq!(mesh["asset"], name);
+            assert_eq!(mesh["source_atlas_slot"], slot);
+            let original = &metadata["assets"][slot];
+            let original_first = original["first_vertex"].as_u64().unwrap() as usize;
+            let first = mesh["first_vertex"].as_u64().unwrap() as usize;
+            let count = mesh["vertex_count"].as_u64().unwrap() as usize;
+            let original_positions = positions(original_first, count);
+            let (min, max) = bounds(&original_positions);
+            let center: [f32; 3] = core::array::from_fn(|a| (min[a] + max[a]) * 0.5);
+            let local = positions(first, count);
+            for i in 0..count {
+                // Normals, UVs, and tangents retain the exact source atlas references.
+                assert_eq!(
+                    &vertices[(original_first + i) * 48 + 12..(original_first + i + 1) * 48],
+                    &vertices[(first + i) * 48 + 12..(first + i + 1) * 48]
+                );
+                for a in 0..3 {
+                    assert!((local[i][a] + center[a] - original_positions[i][a]).abs() < 1e-6);
+                }
+            }
+            let old_index = original["first_index"].as_u64().unwrap() as usize;
+            let new_index = mesh["first_index"].as_u64().unwrap() as usize;
+            for i in 0..mesh["index_count"].as_u64().unwrap() as usize {
+                let read = |start| {
+                    u32::from_le_bytes(indices[start * 4..start * 4 + 4].try_into().unwrap())
+                        as usize
+                };
+                assert_eq!(
+                    read(old_index + i) - original_first,
+                    read(new_index + i) - first
+                );
+            }
+            local_positions.push(local);
+        }
+        let mut counts = [0; 3];
+        let mut seen = [[false; 16]; 16];
+        let mut floor_positions = Vec::new();
+        for (i, tile) in floor["tiles"].as_array().unwrap().iter().enumerate() {
+            let row = tile["row"].as_u64().unwrap() as usize;
+            let col = tile["column"].as_u64().unwrap() as usize;
+            assert!(!seen[row][col]);
+            seen[row][col] = true;
+            let border = row == 0 || row == 15 || col == 0 || col == 15;
+            let group = if border { 2 } else { 1 };
+            assert_eq!(tile["border"], border);
+            let seed = &seeds[(i + 1) * 64..(i + 2) * 64];
+            let values = floats(&seed[..56]);
+            assert_eq!(
+                u32::from_le_bytes(seed[56..60].try_into().unwrap()),
+                group as u32
+            );
+            assert_eq!(
+                u32::from_le_bytes(seed[60..64].try_into().unwrap()),
+                counts[group] << 16
+            );
+            counts[group] += 1;
+            assert_eq!(values[3..6], [1.0; 3]);
+            assert_eq!(values[..3], values[11..14]);
+            let rotation = Quaternion(values[6..10].try_into().unwrap());
+            assert!((rotation.rotate([0.0, 0.0, 1.0])[1] - 1.0).abs() < 1e-6);
+            let transformed: Vec<[f32; 3]> = local_positions[group - 1]
+                .iter()
+                .map(|&p| {
+                    assert!(
+                        dot(p, p).sqrt() <= values[10] + 1e-5,
+                        "culling sphere contains the complete slab"
+                    );
+                    let rotated = rotation.rotate(p);
+                    core::array::from_fn(|a| values[a] + rotated[a])
+                })
+                .collect();
+            let (min, max) = bounds(&transformed);
+            assert!((min[0] - (col as f32 * 2.0 - 16.0)).abs() < 1e-5);
+            assert!((max[0] - (col as f32 * 2.0 - 14.0)).abs() < 1e-5);
+            assert!((min[2] - row as f32 * 2.0).abs() < 1e-5);
+            assert!((max[2] - (row as f32 + 1.0) * 2.0).abs() < 1e-5);
+            assert!((max[1] - floor["top_y"].as_f64().unwrap() as f32).abs() < 1e-5);
+            floor_positions.extend(transformed);
+        }
+        assert!(seen.into_iter().flatten().all(|v| v));
+        assert_eq!(counts, [0, 196, 60]);
+        let (_, max) = bounds(&floor_positions);
+        assert!(max[1] < metadata["gallery_bounds_min"][1].as_f64().unwrap() as f32);
+        let scene_min: [f32; 3] = serde_json::from_value(metadata["bounds_min"].clone()).unwrap();
+        let scene_max: [f32; 3] = serde_json::from_value(metadata["bounds_max"].clone()).unwrap();
+        for p in floor_positions {
+            for a in 0..3 {
+                assert!(p[a] >= scene_min[a] - 1e-5 && p[a] <= scene_max[a] + 1e-5);
+            }
+        }
     }
     #[test]
     fn inverse_transpose_handles_nonuniform_scale_and_rotation() {
