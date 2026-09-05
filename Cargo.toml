@@ -3,7 +3,7 @@ name = "QuadTexture"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Minimal indexed-quad texture Blueprint example."
+description = "Picasso GLB tile gallery with flycam and a separate native quad probe."
 
 [package.metadata.trueos-blueprint]
 replicatable = true
@@ -16,9 +16,16 @@ bench = false
 
 [dependencies]
 trueos = { path = "../TRUEOS-Blueprints/api" }
+trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, features = ["blueprint"] }
+libm = "0.2"
 
 [build-dependencies]
 png = { version = "0.18.1", default-features = false }
+gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
+bevy_mikktspace = "=0.15.3"
+serde_json = "1"
+sha2 = "0.10"
+trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, features = ["host"] }
 
 [profile.dev]
 panic = "abort"

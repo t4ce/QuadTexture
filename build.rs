@@ -1,11 +1,18 @@
+#[path = "build_support/tile_scene.rs"]
+mod tile_scene;
+
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build_support/tile_scene.rs");
+    println!("cargo:rerun-if-changed=assets/industrial_cyberpunk_tilepack");
     println!("cargo:rerun-if-changed=assets/Intel_Graphics_logo.png");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let tile_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("assets/industrial_cyberpunk_tilepack");
+    tile_scene::build(&tile_root, &out_dir);
     let mut decoder = png::Decoder::new(png::io::Cursor::new(include_bytes!(
         "assets/Intel_Graphics_logo.png"
     )));

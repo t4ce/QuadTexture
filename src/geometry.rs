@@ -12,8 +12,8 @@ pub const INDICES: [u32; 6] = [0, 1, 2, 3, 0, 2];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DrawMode {
-    #[default]
     Quad,
+    #[default]
     Triangles,
 }
 
@@ -39,7 +39,7 @@ impl DrawMode {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Quad => "one textured native quad",
-            Self::Triangles => "two textured triangles",
+            Self::Triangles => "GLB triangle gallery",
         }
     }
 }
@@ -49,8 +49,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_quad_can_switch_to_triangles_and_back() {
-        let quad = DrawMode::default();
+    fn default_gallery_can_switch_to_quad_and_back() {
+        let initial = DrawMode::default();
+        assert_eq!(initial, DrawMode::Triangles);
+        let quad = initial.key_event('1' as u32, true);
         assert_eq!(quad, DrawMode::Quad);
         assert_eq!(quad.index_count(), 4);
         let triangles = quad.key_event('3' as u32, true);
