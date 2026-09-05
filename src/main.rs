@@ -2,6 +2,9 @@
 
 extern crate alloc;
 
+mod camera;
+mod frame_retry;
+mod gallery;
 mod geometry;
 
 use alloc::vec::Vec;
@@ -12,8 +15,8 @@ use trueos::input::KEYBOARD_OUTPUT_FLAG_PRESS;
 use trueos::ui4_scene::{Damage, Error as Ui4Error, Frame, ResizeEvent};
 use trueos::vgpu::{
     BUFFER_USAGE_INDEX, BUFFER_USAGE_MAP_WRITE, BUFFER_USAGE_VERTEX, Buffer, Capabilities, Device,
-    IndexedDraw, PRIMITIVE_TOPOLOGY_QUAD_LIST, PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, Queue, QueueClass,
-    RenderPipeline, SAMPLER_ADDRESS_U_REPEAT, SAMPLER_ADDRESS_V_REPEAT,
+    IndexedDraw, PRIMITIVE_TOPOLOGY_QUAD_LIST, Queue, QueueClass, RenderPipeline,
+    SAMPLER_ADDRESS_U_REPEAT, SAMPLER_ADDRESS_V_REPEAT,
     SHADER_PACKAGE_CLIP_POSITION3_UV_TEXTURE_FNV1A64, ShaderModule,
 };
 use trueos::{
@@ -51,6 +54,7 @@ struct QuadTexture {
     timeline: u64,
     pending_resize: Option<ResizeEvent>,
     mode: DrawMode,
+    gallery: gallery::Gallery,
 }
 
 impl QuadTexture {
@@ -91,6 +95,7 @@ impl QuadTexture {
             .map_err(|error| DemoError::Vgpu("index-upload", error))?;
         write_exact(device, texture_buffer, INTEL_LOGO_RGBA8)
             .map_err(|error| DemoError::Vgpu("texture-upload", error))?;
+        let gallery = gallery::Gallery::open(device, WIDTH, HEIGHT)?;
 
         Ok(Self {
             frame,
@@ -104,6 +109,7 @@ impl QuadTexture {
             timeline: 0,
             pending_resize: None,
             mode: DrawMode::default(),
+            gallery,
         })
     }
 
@@ -113,6 +119,13 @@ impl QuadTexture {
             .take_keyboard_event()
             .map_err(|error| DemoError::Ui4("keyboard-event-take", error))?
         {
+            if event.flags & KEYBOARD_OUTPUT_FLAG_PRESS != 0
+                && matches!(event.codepoint, 82 | 114)
+                && self.mode == DrawMode::Triangles
+            {
+                self.gallery
+                    .reset_camera(self.frame.width(), self.frame.height());
+            }
             let mode = self.mode.key_event(
                 event.codepoint,
                 event.flags & KEYBOARD_OUTPUT_FLAG_PRESS != 0,
@@ -130,50 +143,68 @@ impl QuadTexture {
 
     fn render_frame(&mut self) -> Result<(), DemoError> {
         self.service_resize_events()?;
+        self.gallery
+            .service_input(&mut self.frame, self.mode == DrawMode::Triangles)?;
 
         let width = self.frame.width();
         let height = self.frame.height();
         self.frame
             .begin_gpu_frame()
             .map_err(|error| DemoError::Ui4("frame-begin", error))?;
-        let surface = self
-            .device
-            .acquire_ui4_surface(self.frame.window_id())
-            .map_err(|error| DemoError::Vgpu("surface-acquire", error))?;
+        // A failed surface import retains the write lease acquired above.
+        // Retry that import without beginning or resizing another frame.
+        let surface = frame_retry::retry_while(
+            || self.device.acquire_ui4_surface(self.frame.window_id()),
+            |code| *code == trueos::vgpu::ERR_BUSY,
+            yield_frame_retry,
+        )
+        .map_err(|error| DemoError::Vgpu("surface-acquire", error))?;
 
-        let point = self
-            .device
-            .submit_ui4_indexed(
-                self.queue,
-                surface,
-                self.pipeline,
-                self.vertex_buffer,
-                self.index_buffer,
-                IndexedDraw {
-                    index_count: self.mode.index_count(),
-                    topology: match self.mode {
-                        DrawMode::Quad => PRIMITIVE_TOPOLOGY_QUAD_LIST,
-                        DrawMode::Triangles => PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        let point = if self.mode == DrawMode::Triangles {
+            self.gallery
+                .submit(self.device, self.queue, surface, width, height)?
+        } else {
+            self.device
+                .submit_ui4_indexed(
+                    self.queue,
+                    surface,
+                    self.pipeline,
+                    self.vertex_buffer,
+                    self.index_buffer,
+                    IndexedDraw {
+                        index_count: INDICES.len() as u32,
+                        topology: PRIMITIVE_TOPOLOGY_QUAD_LIST,
+                        clear_rgba8_srgb: CLEAR_RGBA8_SRGB,
+                        sampled_texture: self.texture_buffer.raw(),
+                        texture_width: INTEL_LOGO_WIDTH,
+                        texture_height: INTEL_LOGO_HEIGHT,
+                        texture_pitch: INTEL_LOGO_WIDTH * 4,
+                        sampler_flags: SAMPLER_ADDRESS_U_REPEAT | SAMPLER_ADDRESS_V_REPEAT,
+                        ..IndexedDraw::default()
                     },
-                    clear_rgba8_srgb: CLEAR_RGBA8_SRGB,
-                    sampled_texture: self.texture_buffer.raw(),
-                    texture_width: INTEL_LOGO_WIDTH,
-                    texture_height: INTEL_LOGO_HEIGHT,
-                    texture_pitch: INTEL_LOGO_WIDTH * 4,
-                    sampler_flags: SAMPLER_ADDRESS_U_REPEAT | SAMPLER_ADDRESS_V_REPEAT,
-                    ..IndexedDraw::default()
-                },
-            )
-            .map_err(|error| DemoError::Vgpu("textured-indexed-submit", error))?;
+                )
+                .map_err(|error| DemoError::Vgpu("textured-indexed-submit", error))?
+        };
 
-        self.device
-            .wait(self.queue, point.value)
-            .map_err(|code| DemoError::Vgpu("timeline-wait", code))?;
-        self.frame
-            .publish(Damage::full(width, height))
-            .map_err(|error| DemoError::Ui4("frame-publish", error))?;
+        // Submission consumed the surface. An incomplete fence must keep
+        // waiting for this exact point before its frame can be published.
+        frame_retry::retry_while(
+            || self.device.wait(self.queue, point.value),
+            |code| *code == trueos::vgpu::ERR_BUSY,
+            yield_frame_retry,
+        )
+        .map_err(|code| DemoError::Vgpu("timeline-wait", code))?;
+        frame_retry::retry_while(
+            || self.frame.publish(Damage::full(width, height)),
+            |error| matches!(error, Ui4Error::Busy),
+            yield_frame_retry,
+        )
+        .map_err(|error| DemoError::Ui4("frame-publish", error))?;
 
         self.timeline = point.value;
+        if self.mode == DrawMode::Triangles {
+            self.gallery.published(point.value);
+        }
         Ok(())
     }
 
@@ -236,6 +267,7 @@ fn write_exact(device: Device, buffer: Buffer, bytes: &[u8]) -> Result<(), i32> 
 enum DemoError {
     Ui4(&'static str, Ui4Error),
     Vgpu(&'static str, i32),
+    Contract(&'static str),
 }
 
 impl fmt::Display for DemoError {
@@ -243,6 +275,7 @@ impl fmt::Display for DemoError {
         match self {
             Self::Ui4(stage, error) => write!(f, "UI4 {stage} failed: {error:?}"),
             Self::Vgpu(stage, error) => write!(f, "vGPU {stage} failed: {error}"),
+            Self::Contract(stage) => write!(f, "asset contract failed: {stage}"),
         }
     }
 }
@@ -278,7 +311,7 @@ fn run() -> Result<(), DemoError> {
     logl::log(
         level::INFO,
         format_args!(
-            "QuadTexture: {} rendered. keys: 1=quad, 3=triangles. frame={}x{} timeline={}",
+            "QuadTexture: {} rendered. keys: 1=quad logo, 3=triangle gallery, WASD=move, middle-drag=look, R=reset. frame={}x{} timeline={}",
             app.mode.label(),
             WIDTH,
             HEIGHT,
@@ -299,6 +332,16 @@ fn run() -> Result<(), DemoError> {
 }
 
 fn transient_frame_error(error: &DemoError) -> bool {
+    // Begin Busy never acquired a lease. Both submit APIs consume Ui4Surface
+    // and cancel its lease through Drop on failure. Later stages retain the
+    // same lease and are retried inside render_frame instead.
     matches!(error, DemoError::Ui4("frame-begin", Ui4Error::Busy))
-        || matches!(error, DemoError::Vgpu(_, code) if *code == trueos::vgpu::ERR_BUSY)
+        || matches!(error,
+            DemoError::Vgpu("gallery-retained-submit" | "textured-indexed-submit", code)
+                if *code == trueos::vgpu::ERR_BUSY)
+}
+
+fn yield_frame_retry() {
+    vsys::poll_once();
+    vsys::sleep_ms(1);
 }

@@ -2,7 +2,61 @@
 use trueos::vgpu::RetainedCamera;
 use trueos_picasso::cam::{Camera, Projection, Quaternion};
 
-pub(crate) fn look_at_camera_rotation(position: [f32; 3], target: [f32; 3], world_up: [f32; 3]) -> Quaternion {
+/// Frame the complete imported gallery, with a five-percent border on each
+/// screen edge and a slight oblique view that reveals the panels' thickness.
+pub(crate) fn gallery_camera(
+    bounds_min: [f32; 3],
+    bounds_max: [f32; 3],
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Camera {
+    const NEAR: f32 = 0.05;
+    const NDC_MARGIN: f32 = 0.90;
+    let center: [f32; 3] = core::array::from_fn(|axis| (bounds_min[axis] + bounds_max[axis]) * 0.5);
+    let rotation = look_at_camera_rotation([0.12, -0.08, 1.0], [0.0; 3], [0.0, -1.0, 0.0]);
+    let [x, y, z, w] = rotation.0;
+    let inverse_rotation = Quaternion([-x, -y, -z, w]);
+    let backward = rotation.rotate([0.0, 0.0, 1.0]);
+    let yfov = core::f32::consts::FRAC_PI_3;
+    let tan_y = libm::tanf(yfov * 0.5);
+    let aspect = viewport_width.max(1) as f32 / viewport_height.max(1) as f32;
+    let mut distance = NEAR * 2.0;
+    let mut furthest_offset = 0.0f32;
+    for corner in 0..8 {
+        let offset = core::array::from_fn(|axis| {
+            let coordinate = if corner & (1 << axis) == 0 {
+                bounds_min[axis]
+            } else {
+                bounds_max[axis]
+            };
+            coordinate - center[axis]
+        });
+        let local = inverse_rotation.rotate(offset);
+        // Corner depth is distance - local.z. Solve both perspective
+        // inequalities directly, so the oblique corners fit as well as the
+        // center plane at every viewport aspect.
+        distance = distance.max(local[2] + local[0].abs() / (tan_y * aspect * NDC_MARGIN));
+        distance = distance.max(local[2] + local[1].abs() / (tan_y * NDC_MARGIN));
+        distance = distance.max(local[2] + NEAR * 2.0);
+        furthest_offset = furthest_offset.max(-local[2]);
+    }
+    Camera {
+        position: core::array::from_fn(|axis| center[axis] + backward[axis] * distance),
+        rotation,
+        projection: Projection::Perspective {
+            yfov,
+            znear: NEAR,
+            zfar: Some(200.0f32.max(distance + furthest_offset + 1.0)),
+            aspect_ratio: None,
+        },
+    }
+}
+
+pub(crate) fn look_at_camera_rotation(
+    position: [f32; 3],
+    target: [f32; 3],
+    world_up: [f32; 3],
+) -> Quaternion {
     let forward = [
         target[0] - position[0],
         target[1] - position[1],
@@ -178,7 +232,7 @@ pub(crate) fn retained_camera(
     }
 }
 
-const pub(crate) fn identity_mat4() -> [f32; 16] {
+pub(crate) const fn identity_mat4() -> [f32; 16] {
     [
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ]
@@ -238,4 +292,200 @@ pub(crate) fn invert_mat4(matrix: [f32; 16]) -> Option<[f32; 16]> {
         }
     }
     Some(inverse)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.0002, "{actual} != {expected}");
+    }
+
+    fn transform(matrix: [f32; 16], point: [f32; 4]) -> [f32; 4] {
+        core::array::from_fn(|row| {
+            (0..4)
+                .map(|column| matrix[column * 4 + row] * point[column])
+                .sum()
+        })
+    }
+
+    fn perspective() -> Camera {
+        Camera {
+            position: [0.0; 3],
+            rotation: Quaternion::IDENTITY,
+            projection: Projection::Perspective {
+                yfov: core::f32::consts::FRAC_PI_2,
+                znear: 0.25,
+                zfar: Some(100.0),
+                aspect_ratio: None,
+            },
+        }
+    }
+
+    #[test]
+    fn perspective_preserves_w_and_maps_near_far_to_zero_one() {
+        let camera = retained_camera(perspective(), 1200, 600, identity_mat4());
+        for (distance, expected_depth) in [(0.25, 0.0), (100.0, 1.0)] {
+            let clip = transform(camera.view_projection, [0.0, 0.0, -distance, 1.0]);
+            assert_close(clip[3], distance);
+            assert_close(clip[2] / clip[3], expected_depth);
+        }
+        let near = transform(camera.view_projection, [1.0, 0.0, -2.0, 1.0]);
+        let far = transform(camera.view_projection, [1.0, 0.0, -4.0, 1.0]);
+        assert_close(near[0] / near[3], 2.0 * far[0] / far[3]);
+        assert!(transform(camera.view_projection, [0.0, 0.0, 1.0, 1.0])[3] < 0.0);
+    }
+
+    #[test]
+    fn resize_changes_horizontal_field_without_moving_camera() {
+        let initial = perspective();
+        let square = retained_camera(initial, 600, 600, identity_mat4());
+        let wide = retained_camera(initial, 1200, 600, square.view_projection);
+        assert_eq!(square.view, wide.view);
+        assert_eq!(square.position_near, wide.position_near);
+        assert_close(square.projection[0], 2.0 * wide.projection[0]);
+        assert_close(square.projection[5], wide.projection[5]);
+        assert_eq!(wide.previous_view_projection, square.view_projection);
+        let mut authored = initial;
+        if let Projection::Perspective { aspect_ratio, .. } = &mut authored.projection {
+            *aspect_ratio = Some(1.5);
+        }
+        assert_eq!(
+            retained_camera(authored, 600, 600, identity_mat4()).projection,
+            retained_camera(authored, 1200, 600, identity_mat4()).projection
+        );
+    }
+
+    #[test]
+    fn translated_rotated_camera_round_trips_world_and_clip_points() {
+        let mut input = perspective();
+        input.position = [2.0, -1.0, 4.0];
+        input.rotation = Quaternion::from_axis_angle([0.0, 1.0, 0.0], 0.7)
+            * Quaternion::from_axis_angle([1.0, 0.0, 0.0], -0.3);
+        let camera = retained_camera(input, 960, 540, identity_mat4());
+        let origin = transform(camera.view, [2.0, -1.0, 4.0, 1.0]);
+        for (actual, expected) in origin.into_iter().zip([0.0, 0.0, 0.0, 1.0]) {
+            assert_close(actual, expected);
+        }
+        for point in [[2.0, 3.0, -4.0, 1.0], [-3.0, -2.0, -8.0, 1.0]] {
+            let clip = transform(camera.view_projection, point);
+            let restored = transform(camera.inverse_view_projection, clip);
+            for (actual, expected) in restored.into_iter().zip(point) {
+                assert_close(actual, expected);
+            }
+        }
+        for (actual, expected) in
+            multiply_mat4(camera.view_projection, camera.inverse_view_projection)
+                .into_iter()
+                .zip(identity_mat4())
+        {
+            assert_close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn gallery_look_at_keeps_target_centered_with_negative_y_up() {
+        for position in [[2.0, -1.5, 10.0], [-10.0, 2.0, -5.0], [0.0, 0.0, -10.0]] {
+            let target = [0.0; 3];
+            let rotation = look_at_camera_rotation(position, target, [0.0, -1.0, 0.0]);
+            let camera = retained_camera(
+                Camera {
+                    position,
+                    rotation,
+                    ..perspective()
+                },
+                640,
+                360,
+                identity_mat4(),
+            );
+            let clip = transform(camera.view_projection, [0.0, 0.0, 0.0, 1.0]);
+            assert!(clip[3] > 0.0);
+            assert_close(clip[0] / clip[3], 0.0);
+            assert_close(clip[1] / clip[3], 0.0);
+            let up = rotation.rotate([0.0, 1.0, 0.0]);
+            assert!(up[1] < 0.0);
+        }
+    }
+
+    #[test]
+    fn gallery_framing_fits_every_corner_and_uses_available_screen_space() {
+        let bounds_min = [-7.25, -4.75, -0.3];
+        let bounds_max = [7.25, 4.75, 0.3];
+        for (width, height) in [(640, 360), (360, 640), (600, 600)] {
+            let input = gallery_camera(bounds_min, bounds_max, width, height);
+            let camera = retained_camera(input, width, height, identity_mat4());
+            let mut largest_ndc = 0.0f32;
+            for corner in 0..8 {
+                let point = core::array::from_fn(|axis| {
+                    if axis == 3 {
+                        1.0
+                    } else if corner & (1 << axis) == 0 {
+                        bounds_min[axis]
+                    } else {
+                        bounds_max[axis]
+                    }
+                });
+                let clip = transform(camera.view_projection, point);
+                assert!(clip[3] > 0.0);
+                for coordinate in [clip[0] / clip[3], clip[1] / clip[3]] {
+                    assert!(coordinate.abs() <= 0.9002, "{width}x{height}: {coordinate}");
+                    largest_ndc = largest_ndc.max(coordinate.abs());
+                }
+                assert!((0.0..1.0).contains(&(clip[2] / clip[3])));
+            }
+            assert_close(largest_ndc, 0.9);
+            assert!(input.rotation.rotate([0.0, 1.0, 0.0])[1] < 0.0);
+        }
+    }
+
+    #[test]
+    fn gallery_framing_is_translation_invariant_and_accepts_flat_bounds() {
+        let input = gallery_camera([-7.25, -4.75, 0.0], [7.25, 4.75, 0.0], 640, 360);
+        let offset = [20.0, -30.0, 10.0];
+        let shifted = gallery_camera([12.75, -34.75, 10.0], [27.25, -25.25, 10.0], 640, 360);
+        for axis in 0..3 {
+            assert_close(shifted.position[axis] - input.position[axis], offset[axis]);
+        }
+        assert_eq!(input.rotation, shifted.rotation);
+        assert_eq!(input.projection, shifted.projection);
+        let distance = libm::sqrtf(input.position.into_iter().map(|value| value * value).sum());
+        assert!(
+            distance < 12.0,
+            "gallery should fill the initial window: distance={distance}"
+        );
+    }
+
+    #[test]
+    fn infinite_perspective_and_orthographic_depth_are_finite() {
+        let mut input = perspective();
+        if let Projection::Perspective { zfar, .. } = &mut input.projection {
+            *zfar = None;
+        }
+        let infinite = retained_camera(input, 640, 360, identity_mat4());
+        let near = transform(infinite.projection, [0.0, 0.0, -0.25, 1.0]);
+        assert_close(near[2] / near[3], 0.0);
+        let distant = transform(infinite.projection, [0.0, 0.0, -10_000.0, 1.0]);
+        assert!(distant[2] / distant[3] < 1.0);
+        assert!(
+            infinite
+                .inverse_view_projection
+                .into_iter()
+                .all(f32::is_finite)
+        );
+        input.projection = Projection::Orthographic {
+            xmag: 2.0,
+            ymag: 3.0,
+            znear: 0.25,
+            zfar: 100.0,
+        };
+        let orthographic = retained_camera(input, 640, 360, identity_mat4());
+        for (distance, depth) in [(0.25, 0.0), (100.0, 1.0)] {
+            let clip = transform(orthographic.projection, [2.0, 3.0, -distance, 1.0]);
+            for (actual, expected) in clip.into_iter().zip([1.0, 1.0, depth, 1.0]) {
+                assert_close(actual, expected);
+            }
+        }
+        assert!(invert_mat4([0.0; 16]).is_none());
+    }
 }

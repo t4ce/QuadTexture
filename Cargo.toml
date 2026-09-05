@@ -20,7 +20,9 @@ trueos-picasso = { path = "../TRUEOS-Picasso", default-features = false, feature
 libm = "0.2"
 
 [build-dependencies]
-png = { version = "0.18.1", default-features = false }
+png = { path = "../TRUEOS/vendor/png-0.18.1", default-features = false }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+crc32fast = { version = "1.5", default-features = false }
 gltf = { version = "1.4.1", default-features = false, features = ["utils"] }
 bevy_mikktspace = "=0.15.3"
 serde_json = "1"
